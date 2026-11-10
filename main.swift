@@ -2,6 +2,64 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import Darwin
+import Security
+
+protocol CredentialStore {
+    func read() throws -> String?
+    func write(_ value: String) throws
+    func delete() throws
+}
+
+struct KeychainCredentials: CredentialStore {
+    private var query: [String: Any] { [kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "ComfyDraw.localLLM", kSecAttrAccount as String: "apiKey"] }
+    func read() throws -> String? {
+        var q = query
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let code = SecItemCopyMatching(q as CFDictionary, &result)
+        if code == errSecItemNotFound { return nil }
+        guard code == errSecSuccess, let data = result as? Data, let value = String(data: data, encoding: .utf8) else { throw credentialError() }
+        return value
+    }
+    func write(_ value: String) throws {
+        let data = Data(value.utf8)
+        var q = query
+        q[kSecValueData as String] = data
+        guard SecItemAdd(q as CFDictionary, nil) == errSecSuccess else { throw credentialError() }
+    }
+    func delete() throws {
+        let code = SecItemDelete(query as CFDictionary)
+        guard code == errSecSuccess || code == errSecItemNotFound else { throw credentialError() }
+    }
+    private func credentialError() -> NSError {
+        NSError(domain: "ComfyDraw.Keychain", code: 1, userInfo: [NSLocalizedDescriptionKey: "钥匙串操作失败"])
+    }
+}
+
+func saveCredential(_ value: String, store: CredentialStore) throws {
+    guard !value.isEmpty else { return }
+    if let existing = try store.read() {
+        guard existing == value else {
+            throw NSError(domain: "ComfyDraw.Keychain", code: 4, userInfo: [NSLocalizedDescriptionKey: "已有不同 Key；请先备份，再明确删除后设置新 Key"])
+        }
+        return
+    }
+    try store.write(value)
+    guard try store.read() == value else {
+        throw NSError(domain: "ComfyDraw.Keychain", code: 3, userInfo: [NSLocalizedDescriptionKey: "密钥保存验证失败，请检查钥匙串"])
+    }
+}
+
+func migrateCredential(defaults: UserDefaults, store: CredentialStore) throws {
+    guard let old = defaults.string(forKey: AppSettings.llmKeyKey), !old.isEmpty else { return }
+    if let existing = try store.read() {
+        guard existing == old else { throw NSError(domain: "ComfyDraw.Keychain", code: 2, userInfo: [NSLocalizedDescriptionKey: "旧密钥与钥匙串不同，已保留两者"] ) }
+    } else { try store.write(old) }
+    guard try store.read() == old else { throw NSError(domain: "ComfyDraw.Keychain", code: 3, userInfo: [NSLocalizedDescriptionKey: "密钥迁移验证失败"] ) }
+    defaults.removeObject(forKey: AppSettings.llmKeyKey)
+}
 
 final class LocalOnlySessionDelegate: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask,
@@ -17,6 +75,29 @@ private let localSession: URLSession = {
     configuration.connectionProxyDictionary = ["HTTPEnable": 0, "HTTPSEnable": 0]
     return URLSession(configuration: configuration, delegate: LocalOnlySessionDelegate(), delegateQueue: nil)
 }()
+
+func localEndpoint(_ value: String) -> URL? {
+    guard let parts = URLComponents(string: value), parts.scheme == "http",
+          let host = parts.host, host == "127.0.0.1" || host == "localhost",
+          parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
+          parts.percentEncodedPath.isEmpty || parts.percentEncodedPath == "/",
+          let authority = value.components(separatedBy: "/").dropFirst(2).first,
+          !authority.isEmpty, !authority.contains("%") else { return nil }
+    let fields = authority.split(separator: ":", omittingEmptySubsequences: false)
+    guard fields.count <= 2, fields.first.map(String.init) == host else { return nil }
+    var port: Int?
+    if fields.count == 2 {
+        let raw = fields[1]
+        guard !raw.isEmpty, raw.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let number = Int(raw), (1...65535).contains(number) else { return nil }
+        port = number
+    }
+    var normalized = URLComponents()
+    normalized.scheme = "http"
+    normalized.host = "127.0.0.1"
+    normalized.port = port
+    return normalized.url
+}
 
 // MARK: - 本机引擎发现与设置
 
@@ -110,26 +191,9 @@ enum AppSettings {
     static var llmBase: String {
         UserDefaults.standard.string(forKey: llmBaseKey) ?? "http://127.0.0.1:8000"
     }
-    static var llmKeyOverride: String {
-        UserDefaults.standard.string(forKey: llmKeyKey) ?? ""
-    }
-
-    /// Moves a v1.0 "Local Image Desk" directory once so existing history is not lost.
     static func migratedSupportDir() -> URL {
-        let fm = FileManager.default
-        let base = fm.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support", isDirectory: true)
-        let target = base.appendingPathComponent("ComfyDraw", isDirectory: true)
-        let legacy = base.appendingPathComponent("Local Image Desk", isDirectory: true)
-        if !fm.fileExists(atPath: target.path), fm.fileExists(atPath: legacy.path) {
-            try? fm.createDirectory(at: base, withIntermediateDirectories: true)
-            do {
-                try fm.moveItem(at: legacy, to: target)
-            } catch {
-                try? fm.copyItem(at: legacy, to: target)
-            }
-        }
-        return target
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/ComfyDraw", isDirectory: true)
     }
 }
 
@@ -140,12 +204,12 @@ final class LocalEngine {
     static let shared = LocalEngine()
     private var process: Process?
     private var logHandle: FileHandle?
-    var hasActiveGeneration = false
+    var activeGenerations = 0
 
     var isRunning: Bool { process?.isRunning == true }
     var isOwned: Bool { isRunning }
 
-    func start(_ install: EngineInstall) throws {
+    func start(_ install: EngineInstall, port: Int) throws {
         if isRunning { return }
         let fm = FileManager.default
         guard fm.isExecutableFile(atPath: install.python.path),
@@ -156,7 +220,7 @@ final class LocalEngine {
         let child = Process()
         child.executableURL = install.python
         child.currentDirectoryURL = install.root
-        var arguments = ["-s", install.main.path, "--listen", "127.0.0.1", "--port", "8188",
+        var arguments = ["-s", install.main.path, "--listen", "127.0.0.1", "--port", String(port),
                          "--disable-auto-launch",
                          "--input-directory", install.input.path,
                          "--output-directory", install.output.path]
@@ -183,11 +247,6 @@ final class LocalEngine {
         process = child
     }
 
-    // Called only after the queue has been checked; never signals an external process.
-    func stopOwned() {
-        guard let process, process.isRunning else { return }
-        process.terminate()
-    }
 }
 #endif
 
@@ -232,7 +291,7 @@ final class Generator: ObservableObject {
     @Published var isRunning = false {
         didSet {
             #if !APP_TESTING
-            LocalEngine.shared.hasActiveGeneration = isRunning
+            if oldValue != isRunning { LocalEngine.shared.activeGenerations += isRunning ? 1 : -1 }
             #endif
         }
     }
@@ -247,7 +306,8 @@ final class Generator: ObservableObject {
     @Published var engineRoot: String = UserDefaults.standard.string(forKey: AppSettings.engineRootKey) ?? ""
     @Published var detectedEngines: String = "尚未检测"
     @Published var llmBase: String = AppSettings.llmBase
-    @Published var llmKey: String = AppSettings.llmKeyOverride
+    @Published var llmKey: String = ""
+    private let credentialStore: CredentialStore = KeychainCredentials()
     @Published var settingsMessage: String = ""
 
     @Published var unetList: [String] = []
@@ -283,20 +343,16 @@ final class Generator: ObservableObject {
         return nil
         #endif
     }
+    #if APP_TESTING
+    var configuredURL = Generator.configuredBase()
+    #else
     private let configuredURL = Generator.configuredBase()
-    private var base: URL {
-        if let configuredURL { return configuredURL }
-        if let url = URL(string: backendBase), url.scheme == "http" { return url }
-        return URL(string: "http://127.0.0.1:8188")!
-    }
-    private var backendAddressValid: Bool {
-        if configuredURL != nil { return true }
-        guard let parts = URLComponents(string: backendBase),
-              parts.scheme == "http", let host = parts.host,
-              host == "127.0.0.1" || host == "localhost",
-              parts.user == nil, parts.password == nil else { return false }
-        return true
-    }
+    #endif
+    private var activeEndpoint: URL?
+    private var connectedEndpoint: URL?
+    private var selectedEndpoint: URL? { configuredURL ?? localEndpoint(AppSettings.backendBase) }
+    private var generationFinishing = false
+    private var backendAddressValid: Bool { selectedEndpoint != nil }
     private var task: Task<Void, Never>?
     private var currentID: String?
     private var cancellationRequested = false
@@ -304,20 +360,14 @@ final class Generator: ObservableObject {
     private var documentText = ""
     private var documentRequest = UUID()
     private var historyReadFailed = false
+    private var historySnapshot: Data?
+    private let selectedSupportDir: URL
+    private(set) var usingLegacyDirectory = false
     private var connectionRequest = UUID()
 
     // MARK: 路径
 
-    var supportDir: URL {
-        #if APP_TESTING
-        guard let path = ProcessInfo.processInfo.environment["APP_DATA_DIR"], path.hasPrefix("/") else {
-            fatalError("Tests require an absolute APP_DATA_DIR")
-        }
-        return URL(fileURLWithPath: path, isDirectory: true)
-        #else
-        return AppSettings.migratedSupportDir()
-        #endif
-    }
+    var supportDir: URL { selectedSupportDir }
     var archiveDir: URL {
         supportDir.appendingPathComponent("archive", isDirectory: true)
     }
@@ -327,6 +377,19 @@ final class Generator: ObservableObject {
     }
 
     init() {
+        #if APP_TESTING
+        guard let path = ProcessInfo.processInfo.environment["APP_DATA_DIR"], path.hasPrefix("/") else {
+            fatalError("Tests require an absolute APP_DATA_DIR")
+        }
+        selectedSupportDir = URL(fileURLWithPath: path, isDirectory: true)
+        #else
+        let fm = FileManager.default
+        let target = AppSettings.migratedSupportDir()
+        let legacy = target.deletingLastPathComponent().appendingPathComponent("Local Image Desk", isDirectory: true)
+        let useLegacy = !fm.fileExists(atPath: target.path) && fm.fileExists(atPath: legacy.path)
+        selectedSupportDir = useLegacy ? legacy : target
+        usingLegacyDirectory = useLegacy
+        #endif
         loadHistory()
         refresh()
     }
@@ -334,7 +397,8 @@ final class Generator: ObservableObject {
     // MARK: 后端
 
     func refresh() {
-        guard !engineStarting else { return }
+        guard !engineStarting, !isRunning, !generationFinishing else { return }
+        connectedEndpoint = nil
         let requestID = UUID()
         connectionRequest = requestID
         unetList = []
@@ -345,13 +409,16 @@ final class Generator: ObservableObject {
             status = "后端地址无效：仅支持本机 HTTP 地址，例如 http://127.0.0.1:8188"
             return
         }
+        let endpoint = selectedEndpoint!
+        activeEndpoint = endpoint
         engineStarting = true
         Task {
-            defer { engineStarting = false }
+            defer { engineStarting = false; activeEndpoint = nil }
             let ok = await checkBackend()
             guard connectionRequest == requestID else { return }
             backendOK = ok
             if ok {
+                connectedEndpoint = endpoint
                 loadLists(requestID)
                 if !isRunning && !historyReadFailed { status = "绘图引擎已连接" }
                 return
@@ -365,7 +432,8 @@ final class Generator: ObservableObject {
     }
 
     private func checkBackend() async -> Bool {
-        var req = URLRequest(url: base.appendingPathComponent("system_stats"))
+        guard let endpoint = activeEndpoint else { return false }
+        var req = URLRequest(url: endpoint.appendingPathComponent("system_stats"))
         req.timeoutInterval = 3
         guard let (data, response) = try? await localSession.data(for: req),
               (response as? HTTPURLResponse)?.statusCode == 200,
@@ -376,14 +444,14 @@ final class Generator: ObservableObject {
     }
 
     #if !APP_TESTING
-    private static func portAppearsAvailable() -> Bool {
+    private static func portAppearsAvailable(_ port: Int) -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { close(fd) }
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = in_port_t(8188).bigEndian
+        address.sin_port = in_port_t(port).bigEndian
         address.sin_addr = in_addr(s_addr: in_addr_t(INADDR_LOOPBACK).bigEndian)
         return withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -393,7 +461,7 @@ final class Generator: ObservableObject {
     }
 
     private func startLocalEngine(_ requestID: UUID) async {
-        guard autoStartEngine else {
+        guard AppSettings.autoStartEngine else {
             status = "绘图引擎未连接。可在设置中开启自动启动，或手动打开 ComfyUI 后重试"
             return
         }
@@ -402,12 +470,20 @@ final class Generator: ObservableObject {
             status = "未找到可启动的 ComfyUI。请在设置中指定 ComfyUI 目录，或先手动运行 ComfyUI"
             return
         }
-        if !LocalEngine.shared.isRunning && !Self.portAppearsAvailable() {
-            status = "端口 8188 已被占用，且无法识别为 ComfyUI；请检查占用端口的程序后重试"
+        guard let port = activeEndpoint?.port else {
+            status = "自动启动需要显式指定端口，例如 http://127.0.0.1:8188"
+            return
+        }
+        if LocalEngine.shared.isRunning {
+            status = "已有本软件启动的引擎进程，但当前端点不可用；请检查配置"
+            return
+        }
+        if !Self.portAppearsAvailable(port) {
+            status = "端口 \(port) 已被占用，且无法识别为 ComfyUI；请检查占用端口的程序后重试"
             return
         }
         do {
-            try LocalEngine.shared.start(install)
+            try LocalEngine.shared.start(install, port: port)
         } catch {
             backendOK = false
             status = "绘图引擎启动失败：\(error.localizedDescription)"
@@ -418,6 +494,7 @@ final class Generator: ObservableObject {
             if await checkBackend() && LocalEngine.shared.isRunning {
                 guard connectionRequest == requestID else { return }
                 backendOK = true
+                connectedEndpoint = activeEndpoint
                 loadLists(requestID)
                 if !isRunning && !historyReadFailed { status = "本地绘图引擎已就绪" }
                 return
@@ -427,12 +504,13 @@ final class Generator: ObservableObject {
         backendOK = false
         if await checkBackend() {
             backendOK = true
+            connectedEndpoint = activeEndpoint
             loadLists(requestID)
             status = "绘图引擎已连接"
         } else {
             status = LocalEngine.shared.isRunning
-                ? "本地引擎启动超时，请检查端口 8188 后点击刷新"
-                : "本地引擎未能启动；端口 8188 可能被占用，请检查 ComfyUI 日志"
+                ? "本地引擎启动超时，请检查端口 \(port) 后点击刷新"
+                : "本地引擎未能启动；端口 \(port) 可能被占用，请检查 ComfyUI 日志"
         }
     }
     #endif
@@ -445,7 +523,8 @@ final class Generator: ObservableObject {
 
     private func fetchOptions(_ node: String, key: String, requestID: UUID,
                               done: @escaping @MainActor ([String]) -> Void) {
-        guard let url = URL(string: "\(base.absoluteString)/object_info/\(node)") else { return }
+        guard let endpoint = connectedEndpoint else { return }
+        let url = endpoint.appendingPathComponent("object_info").appendingPathComponent(node)
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
         localSession.dataTask(with: request) { data, response, _ in
@@ -457,7 +536,8 @@ final class Generator: ObservableObject {
                   let spec = required[key] as? [Any],
                   let list = spec.first as? [String] else { return }
             Task { @MainActor in
-                guard self.connectionRequest == requestID else { return }
+                guard self.connectionRequest == requestID,
+                      self.connectedEndpoint == self.selectedEndpoint else { return }
                 done(list)
             }
         }.resume()
@@ -512,21 +592,35 @@ final class Generator: ObservableObject {
         }
     }
 
+    func deleteStoredKey() {
+        guard !isAnalyzing else { settingsMessage = "文档分析进行中，无法删除 Key"; return }
+        do {
+            try credentialStore.delete()
+            UserDefaults.standard.removeObject(forKey: AppSettings.llmKeyKey)
+            llmKey = ""
+            settingsMessage = "已删除手动保存的 Key；文档分析将尝试本机 oMLX 配置"
+        } catch { settingsMessage = "删除失败，旧密钥已保留" }
+    }
+
     func saveSettings() {
-        guard let parts = URLComponents(string: backendBase),
-              parts.scheme == "http", let host = parts.host,
-              host == "127.0.0.1" || host == "localhost",
-              parts.user == nil, parts.password == nil else {
-            settingsMessage = "后端地址需为本机 HTTP 地址，例如 http://127.0.0.1:8188"
+        guard !isRunning, !generationFinishing, !engineStarting, !isAnalyzing else { settingsMessage = "任务、文档分析或连接进行中，无法保存设置"; return }
+        guard let endpoint = localEndpoint(backendBase), let textEndpoint = localEndpoint(llmBase) else {
+            settingsMessage = "地址必须为本机 HTTP 根地址，不能包含路径、凭据或查询参数"
             return
         }
+        backendBase = endpoint.absoluteString
+        llmBase = textEndpoint.absoluteString
+        do {
+            try migrateCredential(defaults: .standard, store: credentialStore)
+            if !llmKey.isEmpty {
+                try saveCredential(llmKey, store: credentialStore)
+                llmKey = ""
+            }
+        } catch { settingsMessage = "Key 未保存：\(error.localizedDescription)"; return }
         UserDefaults.standard.set(backendBase, forKey: AppSettings.backendBaseKey)
         UserDefaults.standard.set(autoStartEngine, forKey: AppSettings.autoStartKey)
-        UserDefaults.standard.set(engineRoot.trimmingCharacters(in: .whitespacesAndNewlines),
-                                  forKey: AppSettings.engineRootKey)
-        UserDefaults.standard.set(llmBase.trimmingCharacters(in: .whitespacesAndNewlines),
-                                  forKey: AppSettings.llmBaseKey)
-        UserDefaults.standard.set(llmKey, forKey: AppSettings.llmKeyKey)
+        UserDefaults.standard.set(engineRoot.trimmingCharacters(in: .whitespacesAndNewlines), forKey: AppSettings.engineRootKey)
+        UserDefaults.standard.set(llmBase, forKey: AppSettings.llmBaseKey)
         settingsMessage = "已保存，正在重新连接…"
         detectEngines()
         refresh()
@@ -539,8 +633,8 @@ final class Generator: ObservableObject {
             status = "后端地址无效：仅支持本机 HTTP 地址，例如 http://127.0.0.1:8188"
             return
         }
-        guard !isRunning else { return }
-        guard backendOK else { status = "绘图引擎尚未就绪，请等待或点击刷新"; return }
+        guard !isRunning, !generationFinishing else { return }
+        guard !engineStarting, backendOK, let endpoint = selectedEndpoint, endpoint == connectedEndpoint else { status = "绘图引擎尚未就绪，请等待或点击刷新"; return }
         guard unetList.contains(unet), clipList.contains(clip), vaeList.contains(vae) else {
             status = "请选择有效的图像模型、文本编码器和 VAE；请检查节点及模型后刷新"
             return
@@ -552,6 +646,8 @@ final class Generator: ObservableObject {
             return
         }
 
+        generationFinishing = true
+        activeEndpoint = endpoint
         isRunning = true
         cancellationRequested = false
         uploadedReference = nil
@@ -564,6 +660,7 @@ final class Generator: ObservableObject {
 
         task = Task { [weak self] in
             guard let self else { return }
+            defer { self.activeEndpoint = nil; self.generationFinishing = false }
             var submissionStarted = false
             do {
                 let refName = try await self.prepareReference(snap.0 == "img2img" ? snap.12 : "")
@@ -621,7 +718,8 @@ final class Generator: ObservableObject {
             return body
         }.value
         if cancellationRequested { return "" }
-        var request = URLRequest(url: base.appendingPathComponent("upload/image"))
+        guard let endpoint = activeEndpoint else { throw failure("任务端点不可用") }
+        var request = URLRequest(url: endpoint.appendingPathComponent("upload/image"))
         request.httpMethod = "POST"
         request.timeoutInterval = 30
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -673,7 +771,8 @@ final class Generator: ObservableObject {
                                     "denoise": 1.0]]
         }
 
-        var req = URLRequest(url: base.appendingPathComponent("prompt"))
+        guard let endpoint = activeEndpoint else { throw failure("任务端点不可用") }
+        var req = URLRequest(url: endpoint.appendingPathComponent("prompt"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: ["prompt": flow])
@@ -711,6 +810,7 @@ final class Generator: ObservableObject {
 
     private func poll(_ id: String,
                       snapshot: (String, String, String, Int, Int, Int, Int, Int, Double, String, String, String, String)) async {
+        guard let endpoint = activeEndpoint else { isRunning = false; status = "任务端点不可用"; return }
         let start = Date()
         var failures = 0
         while Date().timeIntervalSince(start) < 3600 {
@@ -721,7 +821,7 @@ final class Generator: ObservableObject {
             }
             try? await Task.sleep(nanoseconds: 1_200_000_000)
             if cancellationRequested { continue }
-            guard let url = URL(string: "\(base.absoluteString)/history/\(id)") else { break }
+            guard let url = URL(string: "\(endpoint.absoluteString)/history/\(id)") else { break }
             var request = URLRequest(url: url)
             request.timeoutInterval = 10
             guard let (data, response) = try? await localSession.data(for: request),
@@ -734,7 +834,7 @@ final class Generator: ObservableObject {
             }
             failures = 0
             if cancellationRequested { continue }
-            var queueRequest = URLRequest(url: base.appendingPathComponent("queue"))
+            var queueRequest = URLRequest(url: endpoint.appendingPathComponent("queue"))
             queueRequest.timeoutInterval = 5
             if let (queueData, queueResponse) = try? await localSession.data(for: queueRequest),
                (queueResponse as? HTTPURLResponse)?.statusCode == 200,
@@ -799,9 +899,10 @@ final class Generator: ObservableObject {
         var downloaded: [(name: String, data: Data)] = []
         do {
             guard !refs.isEmpty else { throw failure("服务器未返回图片") }
+            guard let endpoint = activeEndpoint else { throw failure("任务端点不可用") }
 
             for (i, r) in refs.enumerated() {
-                var comps = URLComponents(url: base.appendingPathComponent("view"),
+                var comps = URLComponents(url: endpoint.appendingPathComponent("view"),
                                           resolvingAgainstBaseURL: false)!
                 comps.queryItems = [
                     URLQueryItem(name: "filename", value: r.0),
@@ -823,6 +924,7 @@ final class Generator: ObservableObject {
             status = "图片已下载，正在保存到本软件归档…"
             let reference = snapshot.0 == "img2img" ? uploadedReference : nil
             if snapshot.0 == "img2img" && reference == nil { throw failure("参考图归档数据缺失") }
+            guard !historyReadFailed else { throw failure("历史记录受保护，拒绝写入归档") }
             let filesToArchive = downloaded
             try await Task.detached {
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -863,7 +965,8 @@ final class Generator: ObservableObject {
     private func cancelServerTask(_ id: String) async {
         // ComfyUI 的 interrupt 是全局操作，检查与调用之间存在竞争，不能安全用于共享服务。
         do {
-            var request = URLRequest(url: base.appendingPathComponent("queue"))
+            guard let endpoint = activeEndpoint else { throw failure("任务端点不可用") }
+            var request = URLRequest(url: endpoint.appendingPathComponent("queue"))
             request.httpMethod = "POST"
             request.timeoutInterval = 10
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -877,6 +980,7 @@ final class Generator: ObservableObject {
     }
 
     func revealFolder() {
+        guard !historyReadFailed else { status = "历史记录受保护，拒绝创建归档"; return }
         do {
             try FileManager.default.createDirectory(at: archiveDir, withIntermediateDirectories: true)
             guard NSWorkspace.shared.open(archiveDir) else { throw failure("Finder 未能打开归档目录") }
@@ -888,9 +992,9 @@ final class Generator: ObservableObject {
     // MARK: 文档 → 提示词
 
     /// 优先使用设置中填写的 Key；留空时兼容读取 oMLX 的 ~/.omlx/settings.json
-    private func resolvedLLMKey() -> String {
-        let override = AppSettings.llmKeyOverride
-        if !override.isEmpty { return override }
+    private func resolvedLLMKey() throws -> String {
+        try migrateCredential(defaults: .standard, store: credentialStore)
+        if let override = try credentialStore.read(), !override.isEmpty { return override }
         let p = NSString(string: "~/.omlx/settings.json").expandingTildeInPath
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: p)),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -965,7 +1069,16 @@ final class Generator: ObservableObject {
         analyzeStatus = "测试模式禁止访问真实 oMLX"
         return
         #endif
-        let key = resolvedLLMKey()
+        guard let chatBase = localEndpoint(AppSettings.llmBase) else {
+            analyzeStatus = "文本服务地址无效，请在设置中检查"
+            return
+        }
+        let chatURL = chatBase.appendingPathComponent("v1/chat/completions")
+        let key: String
+        do { key = try resolvedLLMKey() } catch {
+            analyzeStatus = "钥匙串读取或迁移失败，旧密钥已保留"
+            return
+        }
         guard !key.isEmpty else {
             analyzeStatus = "找不到本地文本模型密钥；请在设置中填写"
             return
@@ -990,12 +1103,6 @@ final class Generator: ObservableObject {
         let h = hint.trimmingCharacters(in: .whitespacesAndNewlines)
         if !h.isEmpty { user += "\n\n额外要求（画面要体现）：\(h)" }
 
-        let chatBase = AppSettings.llmBase.hasSuffix("/")
-            ? String(AppSettings.llmBase.dropLast()) : AppSettings.llmBase
-        guard let chatURL = URL(string: chatBase + "/v1/chat/completions") else {
-            analyzeStatus = "文本服务地址无效，请在设置中检查"
-            return
-        }
         var req = URLRequest(url: chatURL)
         req.httpMethod = "POST"
         req.timeoutInterval = 180
@@ -1011,12 +1118,16 @@ final class Generator: ObservableObject {
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        localSession.dataTask(with: req) { data, _, err in
+        localSession.dataTask(with: req) { data, response, err in
             Task { @MainActor in
                 guard self.documentRequest == requestID else { return }
                 self.isAnalyzing = false
                 if let err {
                     self.analyzeStatus = "请求失败：\(err.localizedDescription)"
+                    return
+                }
+                guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                    self.analyzeStatus = "文本服务返回 HTTP 错误"
                     return
                 }
                 guard let data,
@@ -1055,6 +1166,7 @@ final class Generator: ObservableObject {
         do {
             let data = try Data(contentsOf: historyFile)
             history = try JSONDecoder().decode([HistoryItem].self, from: data)
+            historySnapshot = data
             historyReadFailed = false
         } catch {
             historyReadFailed = true
@@ -1074,17 +1186,17 @@ final class Generator: ObservableObject {
 
         if FileManager.default.fileExists(atPath: historyFile.path) {
             let diskData = try Data(contentsOf: historyFile)
-            let diskItems = try JSONDecoder().decode([HistoryItem].self, from: diskData)
-            guard diskItems.map(\.id) == history.map(\.id) else {
+            guard diskData == historySnapshot else {
                 throw failure("历史记录已被其他窗口修改，请重启后重试；本次图片仍保存在归档文件夹")
             }
-        } else if !history.isEmpty {
+        } else if historySnapshot != nil {
             throw failure("历史记录文件已被移除，拒绝覆盖")
         }
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted]
         let data = try enc.encode(items)
         try data.write(to: historyFile, options: .atomic)
+        historySnapshot = data
     }
 
     func imageURL(for item: HistoryItem, file: String) -> URL {
@@ -1122,7 +1234,7 @@ final class Generator: ObservableObject {
 // MARK: - 主界面
 
 struct ContentView: View {
-    @StateObject private var g = Generator()
+    @ObservedObject var g: Generator
 
     var body: some View {
         HSplitView {
@@ -1187,6 +1299,9 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("设置").font(.title3.weight(.semibold))
+                    if g.usingLegacyDirectory { Text("使用旧目录，原位置保留").font(.caption) }
+                    Text("请避免不同版本同时写入同一历史目录。")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text("一般无需修改。换电脑或改过安装位置时，在这里指定即可。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -1214,7 +1329,7 @@ struct ContentView: View {
                     Text("后端地址").font(.headline)
                     TextField("http://127.0.0.1:8188", text: $g.backendBase)
                         .textFieldStyle(.roundedBorder)
-                    Text("仅支持本机地址。若 ComfyUI 已在别处运行，填它的地址即可。")
+                    Text("仅支持本机回环地址。若 ComfyUI 使用其他本机端口，可在此修改端口。")
                         .font(.caption2).foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1227,12 +1342,22 @@ struct ContentView: View {
                         .textFieldStyle(.roundedBorder)
                     SecureField("API Key（留空则读取 ~/.omlx/settings.json）", text: $g.llmKey)
                         .textFieldStyle(.roundedBorder)
-                    Text("Key 只保存在本机偏好设置中，未加密。不用文档功能可留空。")
+                    Button("删除已保存的 Key") {
+                        let alert = NSAlert()
+                        alert.messageText = "删除已保存的 Key？"
+                        alert.informativeText = "将删除钥匙串及旧偏好设置中的手动 Key，不会删除 oMLX 配置。"
+                        alert.addButton(withTitle: "删除")
+                        alert.addButton(withTitle: "取消")
+                        if alert.runModal() == .alertFirstButtonReturn { g.deleteStoredKey() }
+                    }
+                    .disabled(g.isAnalyzing)
+                    Text("Key 保存在系统钥匙串；留空沿用已存 Key，未设置时读取本机 oMLX 配置。")
                         .font(.caption2).foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Button("保存并重连") { g.saveSettings() }
+                    .disabled(g.isAnalyzing || g.isRunning || g.engineStarting)
                     .buttonStyle(.borderedProminent)
 
                 if !g.settingsMessage.isEmpty {
@@ -1277,9 +1402,8 @@ struct ContentView: View {
                         .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
                         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.25)))
 
-                    Text("反向提示词（可留空）").font(.caption).foregroundStyle(.secondary)
-                    TextField("不要出现的内容", text: $g.negative)
-                        .textFieldStyle(.roundedBorder)
+                    Text("当前 CFG=1，反向提示词不起作用，已禁用。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Divider()
@@ -1734,8 +1858,9 @@ struct ContentView: View {
 @main
 struct ComfyDrawApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    @StateObject private var generator = Generator()
     var body: some Scene {
-        WindowGroup("ComfyDraw") { ContentView() }
+        WindowGroup("ComfyDraw") { ContentView(g: generator) }
             .windowResizability(.contentMinSize)
             .commands { CommandGroup(replacing: .newItem) {} }
     }
@@ -1745,23 +1870,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard LocalEngine.shared.isOwned else { return .terminateNow }
+        guard LocalEngine.shared.activeGenerations > 0 else { return .terminateNow }
         Task { @MainActor in
-            var req = URLRequest(url: URL(string: "http://127.0.0.1:8188/queue")!)
-            req.timeoutInterval = 3
-            let idle: Bool
-            if let (data, response) = try? await localSession.data(for: req),
-               (response as? HTTPURLResponse)?.statusCode == 200,
-               let queue = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let running = queue["queue_running"] as? [Any],
-               let pending = queue["queue_pending"] as? [Any] {
-                idle = running.isEmpty && pending.isEmpty
-            } else {
-                idle = false
-            }
-            if idle && !LocalEngine.shared.hasActiveGeneration {
-                LocalEngine.shared.stopOwned()
-            } else {
+            do {
                 let alert = NSAlert()
                 alert.messageText = "绘图任务或保存可能仍在进行"
                 alert.informativeText = "退出将停止本软件等待和归档；绘图引擎会暂时留在后台，未完成的图片可在 ComfyUI 输出文件夹中查找。"

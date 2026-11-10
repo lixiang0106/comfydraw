@@ -1,0 +1,20 @@
+name: macOS checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify app
+        run: ./build.sh "$RUNNER_TEMP/ComfyDraw-CI.app"
+      - name: Run isolated mock-backend tests
+        run: python3 tests/run_tests.py

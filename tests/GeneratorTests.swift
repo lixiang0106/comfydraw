@@ -1,10 +1,59 @@
 import Foundation
 import AppKit
 
+final class MemoryDefaults: UserDefaults {
+    var values: [String: String] = [:]
+    override func string(forKey defaultName: String) -> String? { values[defaultName] }
+    override func set(_ value: Any?, forKey defaultName: String) { values[defaultName] = value as? String }
+    override func removeObject(forKey defaultName: String) { values.removeValue(forKey: defaultName) }
+}
+
+final class MockCredentials: CredentialStore {
+    var value: String?
+    var failWrite = false
+    var failRead = false
+    var writes = 0
+    func read() throws -> String? {
+        if failRead { throw NSError(domain: "mock", code: 2) }
+        return value
+    }
+    func write(_ value: String) throws {
+        writes += 1
+        if failWrite { throw NSError(domain: "mock", code: 1) }
+        self.value = value
+    }
+    func delete() throws { value = nil }
+}
+
 @main
 struct GeneratorTests {
     @MainActor static func main() async {
         let scenario = CommandLine.arguments[1]
+        let invalid = ["https://127.0.0.1:8188", "http://example.com", "http://127.0.0.1:0", "http://127.0.0.1:65536", "http://127.0.0.1:", "http://127.0.0.1/x", "http://127.0.0.1/%2f", "http://u@127.0.0.1", "http://127.0.0.1?x=1", "http://127.0.0.1#x"]
+        guard invalid.allSatisfy({ localEndpoint($0) == nil }),
+              localEndpoint("http://localhost:8188/")?.absoluteString == "http://127.0.0.1:8188" else { exit(20) }
+        let defaults = MemoryDefaults()
+        let store = MockCredentials()
+        defaults.set("test-value", forKey: AppSettings.llmKeyKey)
+        store.failWrite = true
+        do { try migrateCredential(defaults: defaults, store: store); exit(21) } catch {}
+        guard defaults.string(forKey: AppSettings.llmKeyKey) == "test-value" else { exit(22) }
+        store.failWrite = false
+        do { try migrateCredential(defaults: defaults, store: store) } catch { exit(23) }
+        guard store.value == "test-value", defaults.string(forKey: AppSettings.llmKeyKey) == nil else { exit(24) }
+        let oldWrites = store.writes
+        do { try saveCredential("different", store: store); exit(25) } catch {}
+        guard store.value == "test-value", store.writes == oldWrites else { exit(26) }
+        store.failRead = true
+        do { try saveCredential("different", store: store); exit(27) } catch {}
+        guard store.value == "test-value", store.writes == oldWrites else { exit(28) }
+        store.failRead = false
+        do { try saveCredential("test-value", store: store) } catch { exit(29) }
+        guard store.writes == oldWrites else { exit(30) }
+        let emptyStore = MockCredentials()
+        emptyStore.failWrite = true
+        do { try saveCredential("new", store: emptyStore); exit(31) } catch {}
+        guard emptyStore.value == nil else { exit(32) }
         let g = Generator()
         let readyDeadline = Date().addingTimeInterval(8)
         while !(g.backendOK && g.unetList.contains(g.unet) && g.clipList.contains(g.clip) && g.vaeList.contains(g.vae)) && Date() < readyDeadline {
@@ -23,6 +72,12 @@ struct GeneratorTests {
             g.refImagePath = URL(fileURLWithPath: ProcessInfo.processInfo.environment["APP_DATA_DIR"]!).appendingPathComponent("input.png").path
         }
         g.generate()
+        guard let alternate = ProcessInfo.processInfo.environment["ALT_BASE_URL"],
+              let endpoint = localEndpoint(alternate), endpoint != g.configuredURL else { exit(36) }
+        g.configuredURL = endpoint
+        guard g.configuredURL == endpoint else { exit(37) }
+        g.refresh()
+        g.backendBase = "http://127.0.0.1:1"
         if scenario == "cancel" {
             try? await Task.sleep(nanoseconds: 500_000_000)
             g.cancel()
@@ -51,6 +106,22 @@ struct GeneratorTests {
         }
         let deadline = Date().addingTimeInterval(15)
         while g.isRunning && Date() < deadline { try? await Task.sleep(nanoseconds: 100_000_000) }
+        if scenario == "history_conflict" {
+            guard !g.isRunning, g.history.count == 1 else { exit(33) }
+            do {
+                let original = try Data(contentsOf: g.historyFile)
+                var items = try JSONSerialization.jsonObject(with: original) as! [[String: Any]]
+                items[0]["prompt"] = "external change"
+                let changed = try JSONSerialization.data(withJSONObject: items)
+                try changed.write(to: g.historyFile)
+                g.configuredURL = localEndpoint(ProcessInfo.processInfo.environment["COMFYUI_BASE_URL"]!)
+                g.generate()
+                let retryDeadline = Date().addingTimeInterval(15)
+                while g.isRunning && Date() < retryDeadline { try? await Task.sleep(nanoseconds: 100_000_000) }
+                guard !g.isRunning, g.status.contains("历史记录已被其他窗口修改"), try Data(contentsOf: g.historyFile) == changed else { exit(34) }
+            } catch { exit(35) }
+            exit(0)
+        }
         print("RESULT scenario=\(scenario) running=\(g.isRunning) history=\(g.history.count) images=\(g.images.count) status=\(g.status)")
         guard !g.isRunning else { exit(2) }
         if ["success", "image_cancel", "img2img"].contains(scenario) {

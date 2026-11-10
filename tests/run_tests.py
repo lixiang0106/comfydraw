@@ -78,12 +78,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-def run():
-    exe = ROOT / 'generator-tests'
+def run_in_temp(temp_root):
+    exe = pathlib.Path(temp_root) / 'generator-tests'
     subprocess.run(['swiftc', '-parse-as-library', '-D', 'APP_TESTING', str(APP), str(ROOT / 'GeneratorTests.swift'), '-o', str(exe)], check=True)
     failed = []
-    for scenario in ['success', 'img2img', 'redirect', 'bad_image', 'corrupt', 'save_error', 'cancel', 'fail_history', 'image_cancel', 'history_cancel', 'history_failure_cancel', 'queue_cancel', 'queue_stall']:
-        with tempfile.TemporaryDirectory(prefix='data-', dir=ROOT) as temp:
+    for scenario in ['success', 'img2img', 'redirect', 'bad_image', 'corrupt', 'save_error', 'cancel', 'fail_history', 'image_cancel', 'history_cancel', 'history_failure_cancel', 'queue_cancel', 'queue_stall', 'history_conflict']:
+        with tempfile.TemporaryDirectory(prefix='data-', dir=temp_root) as temp:
             data = pathlib.Path(temp)
             if scenario == 'img2img': (data / 'input.png').write_bytes(PNG)
             if scenario == 'corrupt': (data / 'history.json').write_text('{invalid')
@@ -97,7 +97,7 @@ def run():
             target_thread.start()
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
-            env = dict(os.environ, COMFYUI_BASE_URL=f'http://127.0.0.1:{server.server_port}', APP_DATA_DIR=temp)
+            env = dict(os.environ, COMFYUI_BASE_URL=f'http://127.0.0.1:{server.server_port}', ALT_BASE_URL=f'http://127.0.0.1:{target.server_port}', APP_DATA_DIR=temp)
             try:
                 result = subprocess.run([str(exe), scenario], env=env, capture_output=True, text=True, timeout=22)
                 print(result.stdout.strip(), flush=True)
@@ -106,7 +106,8 @@ def run():
                 if result.returncode: issues.append(f'exit={result.returncode}')
                 posts = [e for e in server.events if e[0] == 'POST']
                 if any(e[1] == '/interrupt' for e in posts): issues.append('global interrupt called')
-                if scenario == 'redirect' and (target.events or not any(e[1] == '/prompt' for e in posts)): issues.append('redirect target reached or prompt missing')
+                if target.events: issues.append('second endpoint received requests')
+                if scenario == 'redirect' and not any(e[1] == '/prompt' for e in posts): issues.append('redirect prompt missing')
                 if scenario in ('cancel', 'history_cancel', 'history_failure_cancel', 'queue_cancel', 'queue_stall') and [e[2] for e in posts if e[1] == '/queue'] != [{'delete': ['test-id']}]: issues.append('incorrect queue deletion')
                 if scenario in ('history_cancel', 'history_failure_cancel', 'queue_cancel') and any(e[0] == 'GET' and e[1] == '/view' for e in server.events): issues.append('entered saving after cancellation')
                 if scenario == 'success':
@@ -133,4 +134,6 @@ def run():
     print('FAILURES', failed, flush=True)
     return bool(failed)
 
-if __name__ == '__main__': raise SystemExit(run())
+if __name__ == '__main__':
+    with tempfile.TemporaryDirectory(prefix='comfydraw-tests-') as temp_root:
+        raise SystemExit(run_in_temp(temp_root))

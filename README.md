@@ -8,6 +8,10 @@ A small native macOS front end for [ComfyUI](https://github.com/Comfy-Org/ComfyU
 >
 > ComfyDraw 是独立第三方项目，与 ComfyUI 官方无隶属关系。
 
+> **Source / Release:** This source tree contains unreleased changes after v1.1. The current v1.1 download does not include these updates.
+>
+> **源码与下载版：**本源码包含 v1.1 之后尚未发布的修改；当前下载版 v1.1 不包含这些更新。
+
 **[下载 macOS 版（Apple Silicon）](https://github.com/lixiang0106/comfydraw/releases/latest)** · [Download for macOS](https://github.com/lixiang0106/comfydraw/releases/latest) · [从源码构建](#option-b--build-from-source)
 
 ---
@@ -18,14 +22,14 @@ A small native macOS front end for [ComfyUI](https://github.com/Comfy-Org/ComfyU
 - **Image to image** — pick a reference picture and redraw it with a strength slider.
 - **Document to prompt** — extract text from PDF/Word and ask a local OpenAI-compatible model for an image prompt.
 - **Local history** — every result is archived on disk with its parameters.
-- **No browser, no extra window** — ComfyDraw starts a local ComfyUI engine in the background and stops it when you quit and nothing is running.
-- **Local only** — requests go to `127.0.0.1`; redirects are refused and no telemetry is sent.
+- **No browser, no extra window** — ComfyDraw can start an existing local ComfyUI engine in the background.
+- **Loopback connections** — the app's drawing and document requests accept local HTTP endpoints; redirects are refused and the app sends no telemetry.
 
 ## Requirements
 
-- macOS 14 or later, Apple Silicon recommended.
+- macOS 14 or later and Apple Silicon (arm64). The current build script targets arm64.
 - **ComfyUI** — either [Comfy Desktop](https://www.comfy.org/download) or a manual install with a `.venv` inside the ComfyUI folder.
-- **ComfyUI-GGUF** custom node (only if you use `.gguf` models).
+- **ComfyUI-GGUF** custom node: the current built-in workflow always uses its `UnetLoaderGGUF` node and a GGUF diffusion model.
 - **Qwen Image models** (the built-in workflow targets this family):
 
   | Role | File |
@@ -34,28 +38,28 @@ A small native macOS front end for [ComfyUI](https://github.com/Comfy-Org/ComfyU
   | Text encoder | `qwen3vl_8b_bf16.safetensors` |
   | VAE | `qwen_image_2.1_vae_bf16.safetensors` |
 
-  Other Qwen Image variants usually work; drop them into your ComfyUI model folders and pick them in the app.
+  Compatibility depends on the selected GGUF diffusion model, text encoder, VAE, and ComfyUI nodes. Other combinations are not guaranteed to work.
 
-Document analysis is optional and needs an OpenAI-compatible endpoint (for example a local oMLX server) plus its API key.
+Document analysis is optional and needs a local OpenAI-compatible endpoint (for example oMLX) and its API key. PDF extraction additionally requires `pdftotext` at one of the paths supported by the app. Word and RTF extraction uses macOS `textutil`.
 
 ## Install
 
 ### Option A — prebuilt app
 
-1. Download the latest release, unzip, and drag `ComfyDraw.app` into `Applications`.
-2. The build is ad-hoc signed, so the first launch needs **right-click → Open** (or `System Settings → Privacy & Security → Open Anyway`).
+1. Download the latest release DMG or ZIP and drag the enclosed `ComfyDraw.app` into `Applications`.
+2. The build is ad-hoc signed, so the first launch may require **right-click → Open** or `System Settings → Privacy & Security → Open Anyway`.
 3. Launch it. ComfyDraw looks for `127.0.0.1:8188`; if nothing is listening it tries to start a local ComfyUI it can find.
 
 ### Option B — build from source
 
 ```bash
-git clone https://github.com/<your-name>/comfydraw.git
+git clone https://github.com/lixiang0106/comfydraw.git
 cd comfydraw
-./build.sh          # produces ComfyDraw.app
+./build.sh          # creates ComfyDraw.app if the path does not already exist
 open ComfyDraw.app
 ```
 
-`build.sh` needs the Swift toolchain (`xcode-select --install` is enough; Xcode is not required).
+`build.sh` needs the Swift toolchain (`xcode-select --install` is enough; Xcode is not required). It refuses to overwrite an existing output. To build alongside an existing app, supply another `.app` path whose parent directory already exists, for example `./build.sh /tmp/ComfyDraw-test.app`.
 
 ## First run
 
@@ -63,7 +67,7 @@ Open **设置 (Settings)** in the app:
 
 - **绘图引擎** — shows which ComfyUI install was detected. If detection misses it, press 选择… and point at the folder that contains `main.py`. Turn auto-start off if you prefer to launch ComfyUI yourself.
 - **后端地址** — defaults to `http://127.0.0.1:8188`. Only loopback addresses are accepted.
-- **文档分析** — optional base URL and API key for a local text model. The key is stored in the app's preferences, unencrypted.
+- **文档分析** — optional loopback base URL and API key for a local text model. A manually entered key is saved in macOS Keychain; leaving it blank uses a saved key or, if none is saved, attempts to read the existing local oMLX configuration. Access may require Keychain authorization. To replace an existing saved key, first back it up securely, then use the explicit delete action before saving the new key.
 
 Model dropdowns are filled from your ComfyUI instance, so whatever you have installed shows up automatically.
 
@@ -77,7 +81,9 @@ ComfyDraw.app
  └── local archive       → ~/Library/Application Support/ComfyDraw
 ```
 
-If port 8188 is free, ComfyDraw launches the detected ComfyUI `main.py` with `--listen 127.0.0.1`, reusing your existing models and input/output folders. It never touches a ComfyUI it did not start, and it never sends a global `/interrupt`.
+In this source version, when auto-start is enabled and the configured local port is free, ComfyDraw can launch a detected ComfyUI `main.py` with `--listen 127.0.0.1`, reusing existing files where detected. The app does not terminate the engine on exit: another client may have submitted work, and a queue check alone cannot rule out a race. You can manage the remaining engine yourself. ComfyDraw never sends a global `/interrupt`.
+
+If the new `ComfyDraw` data directory does not exist but the legacy `Local Image Desk` directory does, this source version continues using the legacy directory in place; it does not move or copy it. If both directories exist, it uses the `ComfyDraw` directory. Avoid running different app versions that write to the same history at the same time: older versions do not participate in this version's history lock.
 
 ## Known limitations
 
@@ -87,11 +93,11 @@ If port 8188 is free, ComfyDraw launches the detected ComfyUI `main.py` with `--
 - Cancel only removes a queued job. A job that is already running keeps going.
 - PDF text extraction covers the first 12 pages; analysis uses at most the first 6000 characters. No OCR for scanned files.
 - Image-to-image is a *reference redraw*, not instruction-based editing.
-- Ad-hoc signed: no notarization, so Gatekeeper requires the right-click → Open step.
+- Ad-hoc signed and not notarized; Gatekeeper may require additional confirmation on first launch.
 
 ## Privacy
 
-ComfyDraw talks only to loopback addresses, refuses HTTP redirects, and sends no analytics. Prompts, reference images and document excerpts stay on your machine — but if you point the backend address at another host, that host receives them. Your ComfyUI installation and any custom nodes you installed may have their own network behaviour, which this app does not control.
+The source version accepts loopback HTTP endpoints for drawing and document analysis, refuses HTTP redirects, and sends no analytics. This restricts where this app sends requests, but it does not authenticate the process listening on the local port: that process receives prompts, reference images, document excerpts, and any applicable API key. Local proxy services, your ComfyUI installation, and installed custom nodes may have their own network behaviour that this app does not control. A manually entered key is kept in Keychain; oMLX's own settings file is not changed.
 
 ## License
 
@@ -105,14 +111,15 @@ ComfyDraw talks only to loopback addresses, refuses HTTP redirects, and sends no
 
 ### 使用前提
 
-- macOS 14 及以上，建议 Apple Silicon。
+- macOS 14 及以上、Apple Silicon（arm64）。
 - 本机已装 ComfyUI（Comfy Desktop 或手动安装，目录里带 `.venv`）。
-- 使用 GGUF 模型时需要 ComfyUI-GGUF 插件。
-- 内置工作流面向 **Qwen Image**：扩散模型、文本编码器、VAE 各一个，装好后在界面里选择即可。
+- 需要 ComfyUI-GGUF 插件：内置工作流始终使用其 GGUF 加载节点。
+- 内置工作流面向 **Qwen Image**，需要匹配的 GGUF 扩散模型、文本编码器和 VAE；其他模型组合尚未保证兼容。
+- 可选的 PDF 文档提取需要安装 `pdftotext`；Word/RTF 使用 macOS 自带的 `textutil`。
 
 ### 安装
 
-下载 Release 里的 `ComfyDraw.app`，拖进「应用程序」。因为是本地签名，第一次打开要**右键 → 打开**。也可以自己编译：`./build.sh`。
+下载 Release 的 DMG 或 ZIP，将其中的 `ComfyDraw.app` 拖进「应用程序」。因为是本地签名，第一次打开可能需要**右键 → 打开**，或在「系统设置 → 隐私与安全性」中确认。也可以自己编译：`./build.sh`；构建脚本不会覆盖已有的同名 App。
 
 ### 第一次使用
 
@@ -120,9 +127,11 @@ ComfyDraw talks only to loopback addresses, refuses HTTP redirects, and sends no
 
 - 会自动检测 Comfy Desktop 安装的实例；没检测到就手动选 ComfyUI 目录（包含 `main.py` 那一层）。
 - 后端地址默认 `http://127.0.0.1:8188`，只接受本机地址。
-- 不用文档功能的话，文档分析那一段可以全部留空。
+- 不用文档功能的话，文档分析那一段可以全部留空。需要替换已经保存的 Key 时，请先安全备份旧 Key，再明确执行「删除已保存的 Key」，然后保存新 Key。
 
-如果 8188 端口空闲，软件会自动在后台启动检测到的 ComfyUI，复用你已有的模型和输入输出目录；退出时若没有任务在跑，会一并关掉它自己启动的引擎。
+在当前源码版本中，开启自动启动后，如果配置的本机端口空闲，软件可在后台启动检测到的 ComfyUI，并尝试复用已有模型和输入输出目录。由于引擎可能被其他客户端共享，退出应用时不会自动关闭引擎；可由用户自行管理后台进程。
+
+如果新的 `ComfyDraw` 数据目录不存在，但旧的 `Local Image Desk` 目录存在，当前源码版本会继续在旧目录原地读写，不会移动或复制旧目录；如果两个目录都存在，则使用 `ComfyDraw` 目录。请避免同时运行写入同一历史目录的不同版本：旧版本不会遵守新版的历史记录锁。
 
 ### 已知限制
 
@@ -135,4 +144,4 @@ ComfyDraw talks only to loopback addresses, refuses HTTP redirects, and sends no
 
 ### 隐私
 
-只访问本机回环地址，不发送统计信息。提示词、参考图和文档节选都留在本机；但如果你把后端地址改成别的机器，内容就会发到那台机器。
+源码版的绘图和文档分析请求只接受本机回环 HTTP 地址，拒绝重定向，不发送遥测数据。但回环地址不能证明监听端口的一定是可信服务；相应本机进程会收到提示词、参考图、文档节选及适用的 API Key。本机转发服务、ComfyUI 和第三方节点自身的网络行为不受本软件控制。手动填写的 Key 存入系统钥匙串；oMLX 自己的设置文件不会被修改。
