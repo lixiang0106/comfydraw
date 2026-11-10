@@ -8,6 +8,8 @@ A small native macOS front end for [ComfyUI](https://github.com/Comfy-Org/ComfyU
 >
 > ComfyDraw 是独立第三方项目，与 ComfyUI 官方无隶属关系。
 
+**[下载 macOS 版（Apple Silicon）](https://github.com/lixiang0106/comfydraw/releases/latest)** · [Download for macOS](https://github.com/lixiang0106/comfydraw/releases/latest) · [从源码构建](#option-b--build-from-source)
+
 ---
 
 ## Features
