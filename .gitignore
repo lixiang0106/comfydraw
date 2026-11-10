@@ -1,0 +1,13 @@
+# Build output
+*.app/
+AppIcon.icns
+
+# Test binaries and scratch data
+tests/generator-tests
+tests/data-*/
+tests/*.dSYM/
+
+# Local backups of previous builds
+.retired/
+
+.DS_Store
