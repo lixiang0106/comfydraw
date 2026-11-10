@@ -13,7 +13,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Build and verify app
         run: ./build.sh "$RUNNER_TEMP/ComfyDraw-CI.app"
       - name: Run isolated mock-backend tests
